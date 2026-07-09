@@ -804,24 +804,55 @@ func (m *model) refreshState() {
 	}
 }
 
+// detectStatus reads the Cursor CLI's UI chrome rather than the conversation
+// text, so prose mentioning "error" or "working" can't skew the status.
 func detectStatus(output string) string {
 	l := strings.ToLower(output)
-	switch {
-	case strings.Contains(l, "error"), strings.Contains(l, "failed"):
-		return "error"
-	case strings.Contains(l, "awaiting input"),
-		strings.Contains(l, "needs input"),
-		strings.Contains(l, "permission"),
-		strings.Contains(l, "do you want"):
-		return "waiting"
-	case strings.Contains(l, "working"),
-		strings.Contains(l, "running"),
-		strings.Contains(l, "thinking"),
-		strings.Contains(l, "implementing"):
+
+	// While the agent runs, the CLI shows a braille spinner and an
+	// "esc to interrupt" hint. Neither appears in conversation prose.
+	if strings.Contains(l, "esc to interrupt") ||
+		strings.Contains(l, "esc to cancel") ||
+		containsBraille(output) {
 		return "running"
-	default:
+	}
+
+	// The input-box placeholder is only visible when the agent is ready.
+	if strings.Contains(l, "add a follow-up") {
 		return "idle"
 	}
+
+	// No placeholder and no spinner: likely an interactive dialog
+	// (permissions, confirmations) replacing the input box.
+	if strings.Contains(l, "do you want") ||
+		strings.Contains(l, "y/n") ||
+		strings.Contains(l, "permission") ||
+		strings.Contains(l, "select an option") ||
+		strings.Contains(l, "enter to confirm") {
+		return "waiting"
+	}
+
+	// Structured error markers at the start of a line (agent crashed or
+	// the CLI printed a hard error), never the word mid-sentence.
+	for _, raw := range strings.Split(output, "\n") {
+		t := strings.TrimSpace(raw)
+		if strings.HasPrefix(t, "Error:") || strings.HasPrefix(t, "✗") || strings.HasPrefix(t, "✘") {
+			return "error"
+		}
+	}
+
+	return "idle"
+}
+
+// containsBraille reports whether s contains braille pattern characters,
+// which the Cursor CLI uses for its activity spinner.
+func containsBraille(s string) bool {
+	for _, r := range s {
+		if r >= 0x2800 && r <= 0x28FF {
+			return true
+		}
+	}
+	return false
 }
 
 // lastMeaningfulLine picks the most recent line of real content, skipping
