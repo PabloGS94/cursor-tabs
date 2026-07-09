@@ -31,6 +31,9 @@ go run .
 - `up` / `down` (or `j` / `k`): move between sessions in the current project
 - `enter`: open selected session (starts one if the project has none)
 - `n`: start an additional session for the current project and open it
+- `t`: set a title for the selected session (shows on the dashboard and in the tmux status bar)
+  - untitled sessions are auto-titled from their first prompt once you send one
+- `p`: pick which projects show as tabs (space toggles, enter saves)
 - `ctrl+q`: detach from a session, back to the list (single keypress)
 - `ctrl+x` twice: stop selected session (first press shows a red confirm hint)
 - `r`: refresh
@@ -45,7 +48,9 @@ go run .
 
 ## Configuration
 
-By default, repos are discovered under `~/dev`.
+By default, repos are discovered under `~/dev` and all of them show as tabs.
+Press `p` inside the app to choose which ones to show; the selection is saved
+to `~/.config/cursor-tabs/config.json`.
 
 Optional environment variables:
 

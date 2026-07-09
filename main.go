@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -40,6 +41,7 @@ func tmuxCmd(args ...string) *exec.Cmd {
 type session struct {
 	Name     string // tmux session name
 	Slot     int    // numeric suffix used for naming; 0 for legacy unsuffixed
+	Title    string // user-given purpose, stored as tmux option @cta_title
 	Status   string
 	Summary  string
 	Activity time.Time
@@ -50,6 +52,21 @@ type project struct {
 	Path     string
 	Prefix   string // tmux session name prefix, e.g. cta_giftcards
 	Sessions []session
+}
+
+type viewMode int
+
+const (
+	viewDashboard viewMode = iota
+	viewPicker
+)
+
+// pickerState backs the interactive "which projects show as tabs" screen.
+type pickerState struct {
+	candidates []project
+	checked    []bool
+	sessions   []int // live session count per candidate at open time
+	cursor     int
 }
 
 type model struct {
@@ -63,10 +80,17 @@ type model struct {
 	height        int
 	pendingKill   string // session name armed for deletion by first ctrl+x
 	pendingKillAt time.Time
+	renaming      bool
+	renameBuf     string
+	view          viewMode
+	picker        pickerState
 }
 
 // pendingKillTimeout is how long a ctrl+x confirmation stays armed.
 const pendingKillTimeout = 3 * time.Second
+
+// maxTitleLen caps session titles, both on input and display.
+const maxTitleLen = 40
 
 type tickMsg time.Time
 
@@ -90,15 +114,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	projects, err := loadProjects()
+	all, err := discoverRepos()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cursor-tabs: %v\n", err)
 		os.Exit(1)
 	}
-	if len(projects) == 0 {
+	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "cursor-tabs: no repos found. set CURSOR_TABS_REPOS or CURSOR_TABS_ROOT")
 		os.Exit(1)
 	}
+	projects := visibleProjects(all, loadConfig().Repos)
 	assignSessionPrefixes(projects)
 
 	m := model{
@@ -106,6 +131,12 @@ func main() {
 		agentCmd: agentCmd,
 	}
 	m.refreshState()
+	// Bring status bars of sessions started by older versions up to date.
+	for _, p := range m.projects {
+		for _, s := range p.Sessions {
+			updateStatusBar(p.Name, s)
+		}
+	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -130,7 +161,72 @@ func requireCommand(name string) error {
 	return nil
 }
 
-func loadProjects() ([]project, error) {
+type config struct {
+	Repos []string `json:"repos"`
+}
+
+func configPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "cursor-tabs", "config.json"), nil
+}
+
+func loadConfig() config {
+	var cfg config
+	path, err := configPath()
+	if err != nil {
+		return cfg
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg
+	}
+	json.Unmarshal(data, &cfg)
+	return cfg
+}
+
+func saveConfig(cfg config) error {
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+// visibleProjects filters discovered repos down to the config selection.
+// An empty selection (no config yet) or one that matches nothing shows all.
+func visibleProjects(all []project, selected []string) []project {
+	if len(selected) == 0 {
+		return all
+	}
+	want := map[string]bool{}
+	for _, p := range selected {
+		want[p] = true
+	}
+	var out []project
+	for _, p := range all {
+		if want[p.Path] {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return all
+	}
+	return out
+}
+
+// discoverRepos finds all candidate git repos, from CURSOR_TABS_REPOS if set,
+// otherwise by scanning the root dir (CURSOR_TABS_ROOT or ~/dev).
+func discoverRepos() ([]project, error) {
 	reposEnv := strings.TrimSpace(os.Getenv("CURSOR_TABS_REPOS"))
 	if reposEnv != "" {
 		return projectsFromEnv(reposEnv)
@@ -306,6 +402,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshState()
 		return m, nil
 	case tea.KeyMsg:
+		if m.view == viewPicker {
+			return m.handlePickerKey(msg)
+		}
+		if m.renaming {
+			return m.handleRenameKey(msg)
+		}
 		// Any key other than a repeat ctrl+x disarms a pending delete.
 		if msg.String() != "ctrl+x" {
 			m.pendingKill = ""
@@ -337,6 +439,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "n":
 			return m.startAndAttach()
+		case "t":
+			s := m.currentSession()
+			if s == nil {
+				m.statusMsg = "no session to title"
+				return m, nil
+			}
+			m.renaming = true
+			m.renameBuf = s.Title
+			return m, nil
+		case "p":
+			m.openPicker()
+			return m, nil
 		case "ctrl+x":
 			s := m.currentSession()
 			if s == nil {
@@ -346,7 +460,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pendingKill == s.Name && time.Since(m.pendingKillAt) <= pendingKillTimeout {
 				m.pendingKill = ""
 				name := s.Name
-				label := fmt.Sprintf("%s #%d", m.currentProject().Name, m.row+1)
+				label := fmt.Sprintf("%s #%d", m.currentProject().Name, s.Slot)
 				return m, runAction(func() (string, error) {
 					return stopSession(name, label)
 				})
@@ -362,6 +476,194 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) openPicker() {
+	candidates, err := discoverRepos()
+	if err != nil || len(candidates) == 0 {
+		m.statusMsg = "could not discover repos"
+		return
+	}
+	assignSessionPrefixes(candidates)
+
+	visible := map[string]bool{}
+	for _, p := range m.projects {
+		visible[p.Path] = true
+	}
+
+	live := liveSessions()
+	checked := make([]bool, len(candidates))
+	sessions := make([]int, len(candidates))
+	cursor := 0
+	for i, c := range candidates {
+		checked[i] = visible[c.Path]
+		for name := range live {
+			if _, ok := parseSlot(name, c.Prefix); ok {
+				sessions[i]++
+			}
+		}
+		if c.Path == m.currentProject().Path {
+			cursor = i
+		}
+	}
+
+	m.picker = pickerState{
+		candidates: candidates,
+		checked:    checked,
+		sessions:   sessions,
+		cursor:     cursor,
+	}
+	m.view = viewPicker
+	m.statusMsg = ""
+}
+
+func (m model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pk := &m.picker
+	n := len(pk.candidates)
+	switch msg.String() {
+	case "up", "k":
+		pk.cursor = (pk.cursor - 1 + n) % n
+	case "down", "j":
+		pk.cursor = (pk.cursor + 1) % n
+	case " ":
+		pk.checked[pk.cursor] = !pk.checked[pk.cursor]
+	case "enter":
+		return m.savePicker()
+	case "esc", "q", "ctrl+c":
+		m.view = viewDashboard
+	}
+	return m, nil
+}
+
+func (m model) savePicker() (tea.Model, tea.Cmd) {
+	var selected []project
+	var paths []string
+	for i, c := range m.picker.candidates {
+		if m.picker.checked[i] {
+			selected = append(selected, c)
+			paths = append(paths, c.Path)
+		}
+	}
+	if len(selected) == 0 {
+		m.statusMsg = "select at least one project"
+		return m, nil
+	}
+	if err := saveConfig(config{Repos: paths}); err != nil {
+		m.statusMsg = fmt.Sprintf("could not save config: %v", err)
+		return m, nil
+	}
+
+	prevPath := m.currentProject().Path
+	m.projects = selected
+	assignSessionPrefixes(m.projects)
+	m.tab = 0
+	for i, p := range m.projects {
+		if p.Path == prevPath {
+			m.tab = i
+			break
+		}
+	}
+	m.row = 0
+	m.view = viewDashboard
+	m.statusMsg = fmt.Sprintf("showing %d projects", len(selected))
+	m.refreshState()
+	return m, nil
+}
+
+func (m model) handleRenameKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.renaming = false
+		if s := m.currentSession(); s != nil {
+			title := strings.TrimSpace(m.renameBuf)
+			s.Title = title
+			setSessionTitle(s.Name, title)
+			updateStatusBar(m.currentProject().Name, *s)
+		}
+		return m, nil
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.renaming = false
+		return m, nil
+	case tea.KeyBackspace:
+		if r := []rune(m.renameBuf); len(r) > 0 {
+			m.renameBuf = string(r[:len(r)-1])
+		}
+		return m, nil
+	case tea.KeySpace:
+		m.renameBuf += " "
+	case tea.KeyRunes:
+		m.renameBuf += string(msg.Runes)
+	}
+	if r := []rune(m.renameBuf); len(r) > maxTitleLen {
+		m.renameBuf = string(r[:maxTitleLen])
+	}
+	return m, nil
+}
+
+// autoTitle derives a session title from the first user prompt. It only
+// trusts the scrollback when the "Cursor Agent" welcome header is still
+// visible, which guarantees we are looking at the true start of the
+// conversation rather than a scrolled-off middle.
+func autoTitle(sessionName string) string {
+	// -J joins wrapped lines so the header/tip lines stay single lines.
+	out, err := tmuxCmd("capture-pane", "-p", "-J", "-t", sessionName, "-S", "-").Output()
+	if err != nil {
+		return ""
+	}
+	sawHeader := false
+	for _, raw := range strings.Split(string(out), "\n") {
+		line := collapseSpaces(strings.TrimSpace(raw))
+		if line == "" {
+			continue
+		}
+		// The input-box border marks the end of the transcript; a
+		// half-typed draft below it must never become the title.
+		if strings.ContainsAny(line, "▄▀") {
+			break
+		}
+		if line == "Cursor Agent" {
+			sawHeader = true
+			continue
+		}
+		if !sawHeader || !hasLetterOrDigit(line) {
+			continue
+		}
+		if strings.HasPrefix(line, "v20") || strings.HasPrefix(line, "Tip:") {
+			continue
+		}
+		if r := []rune(line); len(r) > maxTitleLen {
+			line = string(r[:maxTitleLen-1]) + "…"
+		}
+		return line
+	}
+	return ""
+}
+
+func setSessionTitle(sessionName, title string) {
+	tmuxCmd("set-option", "-t", sessionName, "@cta_title", title).Run()
+}
+
+func getSessionTitle(sessionName string) string {
+	out, err := tmuxCmd("show-option", "-t", sessionName, "-qv", "@cta_title").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// updateStatusBar sets a readable label in the tmux status bar bottom-left,
+// e.g. " giftcards #1 — checkout bugfix ".
+func updateStatusBar(projectName string, s session) {
+	label := fmt.Sprintf(" %s #%d", projectName, s.Slot)
+	if s.Title != "" {
+		label += " — " + s.Title
+	}
+	label += " "
+	tmuxCmd("set-option", "-t", s.Name, "status-left-length", "60").Run()
+	tmuxCmd("set-option", "-t", s.Name, "status-left", label).Run()
+	// Hide the default window list ("0:node*"); the label says it all.
+	tmuxCmd("set-option", "-t", s.Name, "window-status-format", "").Run()
+	tmuxCmd("set-option", "-t", s.Name, "window-status-current-format", "").Run()
 }
 
 // startAndAttach creates a new session in the current project's lowest free
@@ -406,9 +708,15 @@ func startSession(p *project, agentCmd string) (string, error) {
 	// One-key detach: plain Ctrl+Q returns to cursor-tabs. Safe to bind
 	// globally because this tmux server only hosts cursor-tabs sessions.
 	tmuxCmd("bind-key", "-n", "C-q", "detach-client").Run()
+	// Pass real mouse/scroll events through to the agent TUI. Without this,
+	// terminals convert trackpad scrolling into arrow keys, which the agent
+	// interprets as prompt-history navigation.
+	tmuxCmd("set-option", "-g", "mouse", "on").Run()
 	// Show a persistent hint inside the session on how to get back.
 	tmuxCmd("set-option", "-t", name, "status-right",
 		" ctrl+q = back to cursor-tabs ").Run()
+	slot, _ := parseSlot(name, p.Prefix)
+	updateStatusBar(p.Name, session{Name: name, Slot: slot})
 	return name, nil
 }
 
@@ -465,6 +773,14 @@ func (m *model) refreshState() {
 				continue
 			}
 			s := session{Name: name, Slot: slot, Activity: activity}
+			s.Title = getSessionTitle(name)
+			if s.Title == "" {
+				if t := autoTitle(name); t != "" {
+					s.Title = t
+					setSessionTitle(name, t)
+					updateStatusBar(p.Name, s)
+				}
+			}
 			out, err := tmuxCmd("capture-pane", "-p", "-t", name, "-S", "-30").CombinedOutput()
 			if err != nil {
 				s.Status = "error"
@@ -675,7 +991,23 @@ func (m model) View() string {
 	if !m.ready {
 		return "loading..."
 	}
+	if m.view == viewPicker {
+		return m.pickerView()
+	}
+	return m.dashboardView()
+}
 
+// withBottomFooter pads between content and footer so the footer sits on the
+// last lines of the terminal.
+func (m model) withBottomFooter(content, footer string) string {
+	pad := m.height - lipgloss.Height(content) - lipgloss.Height(footer) + 1
+	if pad < 1 {
+		pad = 1
+	}
+	return content + strings.Repeat("\n", pad) + footer
+}
+
+func (m model) dashboardView() string {
 	var b strings.Builder
 
 	b.WriteString(m.renderTabs())
@@ -684,24 +1016,103 @@ func (m model) View() string {
 	p := m.currentProject()
 	if len(p.Sessions) == 0 {
 		b.WriteString(dimStyle.Render("  no sessions — enter or n to start one"))
-		b.WriteString("\n")
 	} else {
+		titleWidth := m.titleColWidth()
 		for i := range p.Sessions {
-			b.WriteString(m.renderSessionRow(i))
-			b.WriteString("\n")
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(m.renderSessionRow(i, titleWidth))
 		}
 	}
 
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("←→ project · ↑↓ session · enter open · n new · ctrl+x stop · ctrl+q back here · q quit"))
+	var f strings.Builder
 	if m.statusMsg != "" {
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(m.statusMsg))
+		f.WriteString(dimStyle.Render(m.statusMsg))
+		f.WriteString("\n")
 	}
-	return b.String()
+	if m.renaming {
+		f.WriteString(cyanStyle.Render("title: ") + m.renameBuf + cyanStyle.Render("▌"))
+		f.WriteString("\n")
+		f.WriteString(dimStyle.Render("enter save · esc cancel"))
+	} else {
+		f.WriteString(dimStyle.Render("←→ project · ↑↓ session · enter open · n new · t title · p projects · ctrl+x stop · ctrl+q back here · q quit"))
+	}
+
+	return m.withBottomFooter(b.String(), f.String())
 }
 
-func (m model) renderSessionRow(i int) string {
+func (m model) pickerView() string {
+	var b strings.Builder
+
+	b.WriteString(boldTitle("Select projects to show as tabs"))
+	b.WriteString("\n\n")
+
+	hiddenRunning := 0
+	for i, c := range m.picker.candidates {
+		if !m.picker.checked[i] && m.picker.sessions[i] > 0 {
+			hiddenRunning += m.picker.sessions[i]
+		}
+		if i > 0 {
+			b.WriteString("\n")
+		}
+
+		marker := "  "
+		if i == m.picker.cursor {
+			marker = cyanStyle.Render("❯ ")
+		}
+		box := "[ ]"
+		if m.picker.checked[i] {
+			box = "[x]"
+		}
+		name := c.Name
+		if i == m.picker.cursor {
+			box = cyanStyle.Render(box)
+			name = cyanStyle.Render(name)
+		} else if !m.picker.checked[i] {
+			name = dimStyle.Render(name)
+		}
+		row := marker + box + " " + name
+		if m.picker.sessions[i] > 0 {
+			row += dimStyle.Render(fmt.Sprintf("  (%d running)", m.picker.sessions[i]))
+		}
+		b.WriteString(row)
+	}
+
+	var f strings.Builder
+	if hiddenRunning > 0 {
+		f.WriteString(yellowStyle.Render(fmt.Sprintf("%d running session(s) will be hidden but keep running", hiddenRunning)))
+		f.WriteString("\n")
+	}
+	if m.statusMsg != "" {
+		f.WriteString(dimStyle.Render(m.statusMsg))
+		f.WriteString("\n")
+	}
+	f.WriteString(dimStyle.Render("↑↓ move · space toggle · enter save · esc cancel"))
+
+	return m.withBottomFooter(b.String(), f.String())
+}
+
+func boldTitle(s string) string {
+	return lipgloss.NewStyle().Bold(true).Render(s)
+}
+
+// titleColWidth returns the display width needed for the title column of the
+// current project, or 0 when no session has a title.
+func (m model) titleColWidth() int {
+	w := 0
+	for _, s := range m.currentProject().Sessions {
+		if n := len([]rune(s.Title)); n > w {
+			w = n
+		}
+	}
+	if w > maxTitleLen {
+		w = maxTitleLen
+	}
+	return w
+}
+
+func (m model) renderSessionRow(i, titleWidth int) string {
 	p := m.currentProject()
 	s := p.Sessions[i]
 	selected := i == m.row
@@ -711,14 +1122,30 @@ func (m model) renderSessionRow(i int) string {
 		marker = cyanStyle.Render("❯ ")
 	}
 
-	num := fmt.Sprintf("%d", i+1)
+	num := fmt.Sprintf("%d", s.Slot)
 	if selected {
 		num = cyanStyle.Render(num)
 	} else {
 		num = dimStyle.Render(num)
 	}
 
-	row := marker + num + "  " + statusLabel(s.Status)
+	row := marker + num
+
+	if titleWidth > 0 {
+		title := []rune(s.Title)
+		if len(title) > titleWidth {
+			title = append(title[:titleWidth-1], '…')
+		}
+		text := string(title) + strings.Repeat(" ", titleWidth-len(title))
+		if selected {
+			text = cyanStyle.Render(text)
+		} else if s.Title == "" {
+			text = dimStyle.Render(text)
+		}
+		row += "  " + text
+	}
+
+	row += "  " + statusLabel(s.Status)
 
 	age := formatAge(s.Activity)
 
