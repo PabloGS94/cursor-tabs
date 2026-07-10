@@ -4,7 +4,7 @@ Minimal terminal session manager for Cursor Agent with left/right tab navigation
 
 ## What it does
 
-- Discovers git repos and shows them as tabs on top.
+- Discovers folders under a root directory and shows them as tabs on top.
 - Runs any number of persistent `tmux` sessions per repo, listed under the tab.
 - Starts Cursor agent (`agent` or `cursor-agent`) inside each session.
 - Lets you attach/detach quickly.
@@ -31,9 +31,12 @@ go run .
 - `up` / `down` (or `j` / `k`): move between sessions in the current project
 - `enter`: open selected session (starts one if the project has none)
 - `n`: start an additional session for the current project and open it
-- `t`: set a title for the selected session (shows on the dashboard and in the tmux status bar)
-  - untitled sessions are auto-titled from their first prompt once you send one
 - `p`: pick which projects show as tabs (space toggles, enter saves)
+
+Session titles come from the Cursor CLI itself: Cursor's auto-generated chat
+title, or whatever you set with `/rename` inside the session (falls back to
+the session's first prompt). They show on the dashboard and in the tmux
+status bar.
 - `ctrl+q`: detach from a session, back to the list (single keypress)
 - `ctrl+x` twice: stop selected session (first press shows a red confirm hint)
 - `r`: refresh
@@ -48,14 +51,14 @@ go run .
 
 ## Configuration
 
-By default, repos are discovered under `~/dev` and all of them show as tabs.
+By default, folders are discovered under `~/dev` and all of them show as tabs.
 Press `p` inside the app to choose which ones to show; the selection is saved
 to `~/.config/cursor-tabs/config.json`.
 
 Optional environment variables:
 
-- `CURSOR_TABS_ROOT` - root dir to scan for git repos
-- `CURSOR_TABS_REPOS` - explicit comma-separated repo paths
+- `CURSOR_TABS_ROOT` - root dir to scan for folders
+- `CURSOR_TABS_REPOS` - explicit comma-separated folder paths
 
 Examples:
 

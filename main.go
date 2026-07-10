@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,10 +43,11 @@ func tmuxCmd(args ...string) *exec.Cmd {
 type session struct {
 	Name     string // tmux session name
 	Slot     int    // numeric suffix used for naming; 0 for legacy unsuffixed
-	Title    string // user-given purpose, stored as tmux option @cta_title
+	Title    string // session purpose, stored as tmux option @cta_title
 	Status   string
 	Summary  string
 	Activity time.Time
+	Created  time.Time
 }
 
 type project struct {
@@ -80,8 +83,6 @@ type model struct {
 	height        int
 	pendingKill   string // session name armed for deletion by first ctrl+x
 	pendingKillAt time.Time
-	renaming      bool
-	renameBuf     string
 	view          viewMode
 	picker        pickerState
 }
@@ -120,7 +121,7 @@ func main() {
 		os.Exit(1)
 	}
 	if len(all) == 0 {
-		fmt.Fprintln(os.Stderr, "cursor-tabs: no repos found. set CURSOR_TABS_REPOS or CURSOR_TABS_ROOT")
+		fmt.Fprintln(os.Stderr, "cursor-tabs: no folders found. set CURSOR_TABS_REPOS or CURSOR_TABS_ROOT")
 		os.Exit(1)
 	}
 	projects := visibleProjects(all, loadConfig().Repos)
@@ -248,13 +249,10 @@ func discoverRepos() ([]project, error) {
 
 	var projects []project
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		repoPath := filepath.Join(root, entry.Name())
-		if isGitRepo(repoPath) {
-			projects = append(projects, project{Name: entry.Name(), Path: repoPath})
-		}
+		projects = append(projects, project{Name: entry.Name(), Path: filepath.Join(root, entry.Name())})
 	}
 
 	sortProjects(projects)
@@ -273,8 +271,8 @@ func projectsFromEnv(raw string) ([]project, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !isGitRepo(abs) {
-			return nil, fmt.Errorf("not a git repo: %s", abs)
+		if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+			return nil, fmt.Errorf("not a directory: %s", abs)
 		}
 		projects = append(projects, project{Name: filepath.Base(abs), Path: abs})
 	}
@@ -299,11 +297,6 @@ func expandHome(path string) string {
 		}
 	}
 	return path
-}
-
-func isGitRepo(path string) bool {
-	_, err := os.Stat(filepath.Join(path, ".git"))
-	return err == nil
 }
 
 func assignSessionPrefixes(projects []project) {
@@ -405,9 +398,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == viewPicker {
 			return m.handlePickerKey(msg)
 		}
-		if m.renaming {
-			return m.handleRenameKey(msg)
-		}
 		// Any key other than a repeat ctrl+x disarms a pending delete.
 		if msg.String() != "ctrl+x" {
 			m.pendingKill = ""
@@ -439,15 +429,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "n":
 			return m.startAndAttach()
-		case "t":
-			s := m.currentSession()
-			if s == nil {
-				m.statusMsg = "no session to title"
-				return m, nil
-			}
-			m.renaming = true
-			m.renameBuf = s.Title
-			return m, nil
 		case "p":
 			m.openPicker()
 			return m, nil
@@ -570,34 +551,61 @@ func (m model) savePicker() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) handleRenameKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEnter:
-		m.renaming = false
-		if s := m.currentSession(); s != nil {
-			title := strings.TrimSpace(m.renameBuf)
-			s.Title = title
-			setSessionTitle(s.Name, title)
-			updateStatusBar(m.currentProject().Name, *s)
-		}
-		return m, nil
-	case tea.KeyEsc, tea.KeyCtrlC:
-		m.renaming = false
-		return m, nil
-	case tea.KeyBackspace:
-		if r := []rune(m.renameBuf); len(r) > 0 {
-			m.renameBuf = string(r[:len(r)-1])
-		}
-		return m, nil
-	case tea.KeySpace:
-		m.renameBuf += " "
-	case tea.KeyRunes:
-		m.renameBuf += string(msg.Runes)
+// applyAutoTitles fills in session titles. Preferred source is the Cursor
+// CLI's own chat title (covers both /rename and Cursor's auto-generated
+// names); fallback is scraping the first prompt from the scrollback.
+func applyAutoTitles(p *project, sessions []session) {
+	if len(sessions) == 0 {
+		return
 	}
-	if r := []rune(m.renameBuf); len(r) > maxTitleLen {
-		m.renameBuf = string(r[:maxTitleLen])
+	chats := projectChats(p.Path)
+
+	// Assign each chat to the session that was most recently created before
+	// the chat started (the agent opens its chat moments after the tmux
+	// session starts). Keep only the most recently updated chat per session.
+	best := map[int]chatMeta{}
+	for _, c := range chats {
+		idx := -1
+		for i := range sessions {
+			if sessions[i].Created.Unix() <= c.CreatedAtMs/1000+5 &&
+				(idx == -1 || sessions[i].Created.After(sessions[idx].Created)) {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			continue
+		}
+		if b, ok := best[idx]; !ok || c.UpdatedAtMs > b.UpdatedAtMs {
+			best[idx] = c
+		}
 	}
-	return m, nil
+
+	for i := range sessions {
+		s := &sessions[i]
+		if c, ok := best[i]; ok && strings.TrimSpace(c.Title) != "" {
+			title := truncateTitle(strings.TrimSpace(c.Title))
+			if title != s.Title {
+				s.Title = title
+				setSessionTitle(s.Name, title)
+				updateStatusBar(p.Name, *s)
+			}
+			continue
+		}
+		if s.Title == "" {
+			if title := autoTitle(s.Name); title != "" {
+				s.Title = title
+				setSessionTitle(s.Name, title)
+				updateStatusBar(p.Name, *s)
+			}
+		}
+	}
+}
+
+func truncateTitle(s string) string {
+	if r := []rune(s); len(r) > maxTitleLen {
+		return string(r[:maxTitleLen-1]) + "…"
+	}
+	return s
 }
 
 // autoTitle derives a session title from the first user prompt. It only
@@ -631,10 +639,7 @@ func autoTitle(sessionName string) string {
 		if strings.HasPrefix(line, "v20") || strings.HasPrefix(line, "Tip:") {
 			continue
 		}
-		if r := []rune(line); len(r) > maxTitleLen {
-			line = string(r[:maxTitleLen-1]) + "…"
-		}
-		return line
+		return truncateTitle(line)
 	}
 	return ""
 }
@@ -740,26 +745,70 @@ func stopSession(name, label string) (string, error) {
 	return fmt.Sprintf("stopped %s", label), nil
 }
 
+type liveInfo struct {
+	activity time.Time
+	created  time.Time
+}
+
 // liveSessions returns all sessions on the cursor-tabs tmux server with their
-// last-activity timestamps. An empty map means the server isn't running.
-func liveSessions() map[string]time.Time {
-	live := map[string]time.Time{}
-	out, err := tmuxCmd("list-sessions", "-F", "#{session_name}\t#{session_activity}").Output()
+// timestamps. An empty map means the server isn't running.
+func liveSessions() map[string]liveInfo {
+	live := map[string]liveInfo{}
+	out, err := tmuxCmd("list-sessions", "-F", "#{session_name}\t#{session_activity}\t#{session_created}").Output()
 	if err != nil {
 		return live
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		parts := strings.Split(line, "\t")
-		if len(parts) != 2 {
+		if len(parts) != 3 {
 			continue
 		}
-		sec, err := strconv.ParseInt(parts[1], 10, 64)
+		activity, err1 := strconv.ParseInt(parts[1], 10, 64)
+		created, err2 := strconv.ParseInt(parts[2], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		live[parts[0]] = liveInfo{activity: time.Unix(activity, 0), created: time.Unix(created, 0)}
+	}
+	return live
+}
+
+// chatMeta mirrors the fields we need from the Cursor CLI's chat metadata
+// files at ~/.cursor/chats/<md5 of cwd>/<chat-id>/meta.json.
+type chatMeta struct {
+	Title       string `json:"title"`
+	CreatedAtMs int64  `json:"createdAtMs"`
+	UpdatedAtMs int64  `json:"updatedAtMs"`
+}
+
+// projectChats lists Cursor CLI chats started from the project directory.
+func projectChats(projectPath string) []chatMeta {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	sum := md5.Sum([]byte(projectPath))
+	dir := filepath.Join(home, ".cursor", "chats", hex.EncodeToString(sum[:]))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var chats []chatMeta
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name(), "meta.json"))
 		if err != nil {
 			continue
 		}
-		live[parts[0]] = time.Unix(sec, 0)
+		var m chatMeta
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		chats = append(chats, m)
 	}
-	return live
+	return chats
 }
 
 func (m *model) refreshState() {
@@ -767,20 +816,13 @@ func (m *model) refreshState() {
 	for i := range m.projects {
 		p := &m.projects[i]
 		var sessions []session
-		for name, activity := range live {
+		for name, info := range live {
 			slot, ok := parseSlot(name, p.Prefix)
 			if !ok {
 				continue
 			}
-			s := session{Name: name, Slot: slot, Activity: activity}
+			s := session{Name: name, Slot: slot, Activity: info.activity, Created: info.created}
 			s.Title = getSessionTitle(name)
-			if s.Title == "" {
-				if t := autoTitle(name); t != "" {
-					s.Title = t
-					setSessionTitle(name, t)
-					updateStatusBar(p.Name, s)
-				}
-			}
 			out, err := tmuxCmd("capture-pane", "-p", "-t", name, "-S", "-30").CombinedOutput()
 			if err != nil {
 				s.Status = "error"
@@ -795,6 +837,7 @@ func (m *model) refreshState() {
 		sort.Slice(sessions, func(a, b int) bool {
 			return sessions[a].Slot < sessions[b].Slot
 		})
+		applyAutoTitles(p, sessions)
 		p.Sessions = sessions
 	}
 	if n := len(m.currentProject().Sessions); n == 0 {
@@ -1062,13 +1105,7 @@ func (m model) dashboardView() string {
 		f.WriteString(dimStyle.Render(m.statusMsg))
 		f.WriteString("\n")
 	}
-	if m.renaming {
-		f.WriteString(cyanStyle.Render("title: ") + m.renameBuf + cyanStyle.Render("▌"))
-		f.WriteString("\n")
-		f.WriteString(dimStyle.Render("enter save · esc cancel"))
-	} else {
-		f.WriteString(dimStyle.Render("←→ project · ↑↓ session · enter open · n new · t title · p projects · ctrl+x stop · ctrl+q back here · q quit"))
-	}
+	f.WriteString(dimStyle.Render("←→ project · ↑↓ session · enter open · n new · p projects · ctrl+x stop · ctrl+q back here · q quit"))
 
 	return m.withBottomFooter(b.String(), f.String())
 }
